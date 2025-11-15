@@ -1,0 +1,1410 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+#include <time.h>
+#include <string.h>
+
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <FS.h>
+#include <SPIFFS.h>
+
+// Audio playback (WAV from SPIFFS)
+#include "AudioFileSourceSPIFFS.h"
+#include "AudioGeneratorWAV.h"
+#include "AudioOutputI2SNoDAC.h" // Uses ESP32 internal DAC (GPIO25)
+
+// ========================== Wi‑Fi AP (Hotspot) + Captive Portal ==========================
+#define DNS_PORT 53
+const char *AP_SSID = "ESP32-Setup";
+const char *AP_PASS = "12345678"; // at least 8 chars (or set "" for open)
+IPAddress apIP(192, 168, 4, 1);
+IPAddress apGateway(192, 168, 4, 1);
+IPAddress apSubnet(255, 255, 255, 0);
+
+DNSServer dnsServer;
+WebServer server(80);
+Preferences prefs;       // for Wi‑Fi creds
+Preferences prefsSched;  // for power window/settings
+bool apRunning = false;
+bool mqttConnectPending = false;
+bool timeSyncPending = false; // trigger a time sync soon after Wi‑Fi connects
+
+// ========================== MQTT broker ==========================
+const char *MQTT_HOST = "192.168.10.41";
+const uint16_t MQTT_PORT = 1883;
+const char *MQTT_USER = "engineer";
+const char *MQTT_PASS = "123456";
+
+// ========================== Topics ==========================
+const char *TOPIC_TELEMETRY = "esp32/demo/telemetry";
+const char *TOPIC_CMD = "test";
+const char *TOPIC_STATUS = "esp32/demo/status";
+const char *LWT_OFFLINE = "offline";
+const char *ONLINE_MSG = "online";
+
+// ========================== Telemetry settings ==========================
+const unsigned long PUBLISH_INTERVAL_MS = 2000;
+
+// ========================== Default playback timing ==========================
+const unsigned long DEFAULT_DELAY_MS = 60000UL; // 1 minute default
+
+// ========================== Hardware pins ==========================
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 2
+#endif
+const int ADC_PIN = 34; // optional telemetry
+
+// ========================== Sound mapping (2 sounds) ==========================
+// Put these files in /data and upload SPIFFS:
+// PLAY1 -> /gunshot.wav
+// PLAY2 -> /eagle.wav
+static const char *SOUND_PATHS[] = {
+    "/gunshot.wav", // index 0 (PLAY1)
+    "/eagle.wav",   // index 1 (PLAY2)
+};
+static const int SOUND_COUNT = 2;
+
+// ========================== Internals ==========================
+WiFiClient wifiClient;
+PubSubClient mqtt(wifiClient);
+
+String clientId;
+unsigned long lastPub = 0;
+bool isPlaying = false;
+String currentFile = "";
+
+// Audio objects
+AudioGeneratorWAV *wav = nullptr;
+AudioFileSourceSPIFFS *file = nullptr;
+AudioOutputI2SNoDAC *out = nullptr;
+
+// ========================== Scheduler state ==========================
+enum PlayMode
+{
+  MODE_IDLE = 0,
+  MODE_PLAYLIST,     // cycle through user-defined playlist with delay
+  MODE_SINGLE_REPEAT // repeat one sound with delay
+};
+
+PlayMode mode = MODE_IDLE;
+unsigned long userDelayMs = DEFAULT_DELAY_MS;
+
+bool hasSchedule = false;
+unsigned long nextStartAt = 0; // millis() when next playback should start
+
+// Playlist config
+const int MAX_PLAYLIST = 16;
+int playlist[MAX_PLAYLIST]; // 0-based sound indices
+int playlistLen = 0;
+int playlistPos = 0; // next position to play within playlist
+
+// Single repeat config
+int singleIndex = -1; // 0-based, only valid in MODE_SINGLE_REPEAT
+
+// ========================== IST / NTP time sync ==========================
+// Indian Standard Time (no DST)
+static const char* TZ_IST = "IST-5:30";
+
+// NTP servers (primary + fallback)
+static const char* NTP_PRIMARY   = "time.google.com";
+static const char* NTP_FALLBACK1 = "pool.ntp.org";
+
+// Time sync cadence
+static const uint32_t INITIAL_SYNC_MAX_WAIT_MS = 5000;     // ~5 s cap for initial wait
+static const uint32_t RESYNC_INTERVAL_SEC      = 6 * 3600; // re-sync every 6 hours
+
+RTC_DATA_ATTR time_t lastSyncEpoch = 0;
+unsigned long lastPrintMs = 0;
+unsigned long lastResyncCheckMs = 0;
+
+static bool timeIsReasonable() {
+  time_t now = time(nullptr);
+  return now >= 1672531200; // >= 2023-01-01
+}
+
+static void printNowIST() {
+  struct tm ti;
+  if (getLocalTime(&ti, 50)) {
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &ti);
+    Serial.printf("[TIME] %s\n", buf);
+  } else {
+    Serial.println("[TIME] Not set");
+  }
+}
+
+static bool resolveOrCopy(const char* host, char out[32]) {
+  unsigned long t0 = millis();
+  IPAddress ip;
+  bool ok = (WiFi.hostByName(host, ip) == 1);
+  unsigned long dt = millis() - t0;
+  if (ok) {
+    String s = ip.toString();
+    s.toCharArray(out, 32);
+    Serial.printf("[DNS] %s -> %s in %lu ms\n", host, out, dt);
+    return true;
+  } else {
+    Serial.printf("[DNS] %s resolution failed in %lu ms; using hostname\n", host, dt);
+    strlcpy(out, host, 32);
+    return false;
+  }
+}
+
+static void configureTimeISTWithResolvedServers() {
+  static char s1[32], s2[32], s3[32];
+  resolveOrCopy(NTP_PRIMARY,   s1);
+  resolveOrCopy(NTP_FALLBACK1, s2);
+  s3[0] = '\0';
+  Serial.printf("[NTP] Using servers: %s, %s\n", s1, s2);
+  configTzTime(TZ_IST, s1, s2, s3);
+}
+
+static bool waitForInitialNtp(uint32_t maxWaitMs) {
+  unsigned long start = millis();
+  struct tm ti;
+  while ((millis() - start) < maxWaitMs) {
+    if (getLocalTime(&ti, 100)) {
+      time_t now = mktime(&ti);
+      if (now >= 1672531200) return true;
+    }
+    delay(100);
+  }
+  return timeIsReasonable();
+}
+
+static bool syncTimeIfNeeded(bool force = false) {
+  if (!WiFi.isConnected() || apRunning) return false;
+
+  time_t now = time(nullptr);
+  bool initialNeeded  = !timeIsReasonable();
+  bool periodicNeeded = timeIsReasonable() && (lastSyncEpoch == 0 || (now - lastSyncEpoch) > RESYNC_INTERVAL_SEC);
+
+  if (!(force || initialNeeded || periodicNeeded)) return true;
+
+  Serial.println("[NTP] Configuring IST and starting sync...");
+  configureTimeISTWithResolvedServers();
+
+  bool ok = waitForInitialNtp(INITIAL_SYNC_MAX_WAIT_MS);
+  if (ok) {
+    time_t tnow = time(nullptr);
+    lastSyncEpoch = tnow;
+    struct tm ti;
+    localtime_r(&tnow, &ti);
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &ti);
+    Serial.printf("[NTP] Time synced: %s (epoch %ld)\n", buf, (long)tnow);
+  } else {
+    Serial.println("[NTP] No SNTP response within short wait; will retry later.");
+  }
+  return ok;
+}
+
+// ========================== Forward declarations (fix for PlatformIO .cpp) ==========================
+static void audioStop();
+static void publishPowerStatus();
+
+// ========================== Power Window / Overrides with Day-of-Week ==========================
+/*
+  Days mask mapping (tm_wday: 0=Sun ... 6=Sat)
+  bit 0 -> Sun, bit 1 -> Mon, ... bit 6 -> Sat
+*/
+static const uint8_t DAYS_ALL      = 0x7F; // 0b01111111
+static const uint8_t DAYS_WEEKDAYS = (1<<1)|(1<<2)|(1<<3)|(1<<4)|(1<<5);
+static const uint8_t DAYS_WEEKEND  = (1<<0)|(1<<6);
+
+struct DailyWindow {
+  bool enabled;
+  uint16_t startMin; // minutes since midnight local
+  uint16_t endMin;   // minutes since midnight local
+  uint8_t daysMask;  // 7-bit mask for Sun..Sat
+} dailyWindow = { false, (uint16_t)(8*60), (uint16_t)(18*60), DAYS_ALL };
+
+// Persistent override (wins over window until cleared)
+enum PowerOverride { OVR_NONE = 0, OVR_FORCE_ON = 1, OVR_FORCE_OFF = 2 };
+PowerOverride persistentOverride = OVR_NONE;
+
+// Timed overrides (win over window when active; persistent is cleared when these are set)
+unsigned long overrideOnUntilMs  = 0; // when > now -> force ON
+unsigned long overrideOffUntilMs = 0; // when > now -> force OFF
+
+bool powerOn = true; // current applied power
+
+static bool parseHHMM(const String& s, uint16_t& outMin) {
+  int p = s.indexOf(':');
+  if (p < 0) return false;
+  int hh = s.substring(0, p).toInt();
+  int mm = s.substring(p + 1).toInt();
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return false;
+  outMin = (uint16_t)(hh * 60 + mm);
+  return true;
+}
+
+static void hhmmFromMin(uint16_t m, char out[6]) {
+  uint16_t hh = (m / 60) % 24;
+  uint16_t mm = m % 60;
+  snprintf(out, 6, "%02u:%02u", hh, mm);
+}
+
+static uint16_t minutesNowLocal() {
+  struct tm ti;
+  if (getLocalTime(&ti, 50)) {
+    return (uint16_t)(ti.tm_hour * 60 + ti.tm_min);
+  }
+  return 0;
+}
+
+static int dowNowLocal() {
+  struct tm ti;
+  if (getLocalTime(&ti, 50)) {
+    return ti.tm_wday; // 0..6
+  }
+  return 0;
+}
+
+static bool isDayInMask(uint8_t mask, int dow /*0..6 Sun..Sat*/) {
+  return (mask & (1 << dow)) != 0;
+}
+
+static int prevDow(int dow) { return (dow + 6) % 7; }
+
+static bool isWithinDailyWindowNow() {
+  if (!dailyWindow.enabled) return true;
+  if (!timeIsReasonable()) return true;
+
+  uint16_t m = minutesNowLocal();
+  uint16_t s = dailyWindow.startMin;
+  uint16_t e = dailyWindow.endMin;
+  int dow = dowNowLocal();
+
+  if (s == e) {
+    return false;
+  } else if (s < e) {
+    if (!isDayInMask(dailyWindow.daysMask, dow)) return false;
+    return (m >= s && m < e);
+  } else {
+    bool todaySel = isDayInMask(dailyWindow.daysMask, dow);
+    bool prevSel  = isDayInMask(dailyWindow.daysMask, prevDow(dow));
+    if (m >= s) return todaySel;
+    else        return (m < e) && prevSel;
+  }
+}
+
+static bool desiredPower() {
+  unsigned long nowMs = millis();
+  // Persistent override wins first
+  if (persistentOverride == OVR_FORCE_OFF) return false;
+  if (persistentOverride == OVR_FORCE_ON)  return true;
+  // Then timed overrides
+  if (overrideOffUntilMs && (long)(overrideOffUntilMs - nowMs) > 0) return false;
+  if (overrideOnUntilMs  && (long)(overrideOnUntilMs  - nowMs) > 0) return true;
+  // Then window
+  return isWithinDailyWindowNow();
+}
+
+static String daysMaskToString(uint8_t mask) {
+  static const char* names[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+  String s;
+  bool first = true;
+  for (int i=0;i<7;i++){
+    if (mask & (1<<i)) {
+      if (!first) s += ",";
+      s += names[i];
+      first = false;
+    }
+  }
+  if (s.length()==0) s = "-";
+  return s;
+}
+
+static int tokenToDow(const String& tokUpper) {
+  if (tokUpper == "SUN") return 0;
+  if (tokUpper == "MON") return 1;
+  if (tokUpper == "TUE" || tokUpper == "TUES") return 2;
+  if (tokUpper == "WED") return 3;
+  if (tokUpper == "THU" || tokUpper == "THUR" || tokUpper=="THURS") return 4;
+  if (tokUpper == "FRI") return 5;
+  if (tokUpper == "SAT") return 6;
+  return -1;
+}
+
+static uint8_t parseDaysMaskFromArray(JsonVariantConst arr) {
+  uint8_t mask = 0;
+  if (!arr.is<JsonArrayConst>()) return mask;
+  for (JsonVariantConst v : arr.as<JsonArrayConst>()) {
+    if (v.is<int>()) {
+      int d = v.as<int>();
+      if (d >= 0 && d <= 6) mask |= (1 << d);
+    } else if (v.is<const char*>() || v.is<String>()) {
+      String t = v.is<const char*>() ? String(v.as<const char*>()) : v.as<String>();
+      t.trim(); t.toUpperCase();
+      int idx = tokenToDow(t);
+      if (idx >= 0) mask |= (1 << idx);
+    }
+  }
+  return mask;
+}
+
+static uint8_t parseDaysMaskFromString(const String& sIn) {
+  String s = sIn; s.trim(); s.toUpperCase();
+  if (s == "ALL") return DAYS_ALL;
+  if (s == "WEEKDAYS") return DAYS_WEEKDAYS;
+  if (s == "WEEKEND")  return DAYS_WEEKEND;
+
+  uint8_t mask = 0;
+  int start = 0;
+  while (start < (int)s.length()) {
+    int comma = s.indexOf(',', start);
+    String token = (comma >= 0) ? s.substring(start, comma) : s.substring(start);
+    token.trim();
+    int dash = token.indexOf('-');
+    if (dash > 0) {
+      String a = token.substring(0, dash); a.trim();
+      String b = token.substring(dash+1);  b.trim();
+      a.toUpperCase(); b.toUpperCase();
+      int ia = tokenToDow(a);
+      int ib = tokenToDow(b);
+      if (ia >= 0 && ib >= 0) {
+        int i = ia;
+        while (true) {
+          mask |= (1 << i);
+          if (i == ib) break;
+          i = (i + 1) % 7;
+        }
+      }
+    } else {
+      token.toUpperCase();
+      int idx = tokenToDow(token);
+      if (idx >= 0) mask |= (1 << idx);
+    }
+    if (comma < 0) break;
+    start = comma + 1;
+  }
+  return mask;
+}
+
+static void publishPowerStatus() {
+  char sBuf[6], eBuf[6];
+  hhmmFromMin(dailyWindow.startMin, sBuf);
+  hhmmFromMin(dailyWindow.endMin, eBuf);
+
+  const char* ovr =
+    (persistentOverride == OVR_FORCE_ON)  ? "PERSIST_ON" :
+    (persistentOverride == OVR_FORCE_OFF) ? "PERSIST_OFF" : "NONE";
+
+  String msg = String("power:") + (powerOn ? "ON" : "OFF") +
+               " window_en:" + (dailyWindow.enabled ? "1" : "0") +
+               " window:" + sBuf + "-" + eBuf +
+               " days:" + daysMaskToString(dailyWindow.daysMask) +
+               " ovr_persist:" + ovr +
+               " ovr_on_ms:" + (overrideOnUntilMs  ? (long)(overrideOnUntilMs  - (long)millis()) : 0) +
+               " ovr_off_ms:" + (overrideOffUntilMs ? (long)(overrideOffUntilMs - (long)millis()) : 0);
+  if (mqtt.connected()) mqtt.publish(TOPIC_STATUS, msg.c_str(), false);
+  Serial.println(msg);
+}
+
+static void applyPowerTransitionIfNeeded() {
+  bool want = desiredPower();
+  if (want == powerOn) return;
+
+  powerOn = want;
+  if (!powerOn) {
+    if (isPlaying) audioStop();
+  }
+  publishPowerStatus();
+}
+
+// ========================== Core helpers (audio & scheduling) ==========================
+static inline bool timeReached(unsigned long t)
+{
+  return (long)(millis() - t) >= 0;
+}
+
+long msUntilNext()
+{
+  if (!hasSchedule)
+    return -1;
+  return (long)(nextStartAt - millis());
+}
+
+void scheduleIn(unsigned long delayMs)
+{
+  hasSchedule = true;
+  nextStartAt = millis() + delayMs;
+}
+
+const char *modeName(PlayMode m)
+{
+  switch (m)
+  {
+  case MODE_IDLE:
+    return "IDLE";
+  case MODE_PLAYLIST:
+    return "PLAYLIST";
+  case MODE_SINGLE_REPEAT:
+    return "SINGLE";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+void publishStatus(const String &s)
+{
+  if (mqtt.connected())
+  {
+    mqtt.publish(TOPIC_STATUS, s.c_str(), false);
+  }
+}
+
+void audioCleanup()
+{
+  if (wav)
+  {
+    delete wav;
+    wav = nullptr;
+  }
+  if (out)
+  {
+    delete out;
+    out = nullptr;
+  }
+  if (file)
+  {
+    delete file;
+    file = nullptr;
+  }
+}
+
+bool audioStart(const char *path)
+{
+  if (!SPIFFS.exists(path))
+  {
+    Serial.printf("WAV file not found: %s\n", path);
+    publishStatus(String("wav_missing:") + path);
+    return false;
+  }
+
+  // CRITICAL FIX: Check power state before starting audio
+  if (!powerOn) {
+    Serial.println("Audio start blocked: power is OFF");
+    publishStatus("play_blocked:power_off");
+    return false;
+  }
+
+  if (wav && wav->isRunning())
+    wav->stop();
+  audioCleanup();
+
+  file = new AudioFileSourceSPIFFS(path);
+  out = new AudioOutputI2SNoDAC(); // Internal DAC on GPIO25
+  out->SetGain(0.5f);
+
+  wav = new AudioGeneratorWAV();
+  if (!wav->begin(file, out))
+  {
+    Serial.println("Failed to start WAV playback.");
+    audioCleanup();
+    return false;
+  }
+
+  isPlaying = true;
+  currentFile = path;
+  digitalWrite(LED_BUILTIN, HIGH);
+  Serial.printf("WAV playback started: %s\n", path);
+
+  publishStatus(String("playing:") + path);
+  return true;
+}
+
+static void audioStop()
+{
+  if (wav && wav->isRunning())
+    wav->stop();
+  audioCleanup();
+  isPlaying = false;
+  currentFile = "";
+  digitalWrite(LED_BUILTIN, LOW);
+  Serial.println("WAV playback stopped.");
+  publishStatus("stopped");
+}
+
+void cancelSchedule()
+{
+  hasSchedule = false;
+  nextStartAt = 0;
+}
+
+void stopEverything()
+{
+  audioStop();
+  cancelSchedule();
+  mode = MODE_IDLE;
+  publishStatus("mode:IDLE");
+}
+
+// Map tokens to 0-based sound index
+int mapNameToIndex0(const String &raw)
+{
+  String s = raw;
+  s.toLowerCase();
+  if (s == "play1" || s == "1" || s == "gunshot" || s == "gunshot.wav")
+    return 0;
+  if (s == "play2" || s == "2" || s == "eagle" || s == "eagle.wav")
+    return 1;
+  return -1;
+}
+
+// ===== Playlist / Single start helpers =====
+unsigned long parseDelayMs(const JsonVariantConst &root, unsigned long current)
+{
+  if (root.containsKey("delay_ms"))
+  {
+    long v = root["delay_ms"].as<long>();
+    if (v > 0)
+      return (unsigned long)v;
+  }
+  if (root.containsKey("delay_s"))
+  {
+    long s = root["delay_s"].as<long>();
+    if (s > 0)
+      return (unsigned long)s * 1000UL;
+  }
+  return current;
+}
+
+bool parsePlaylistJSON(const JsonVariantConst &root, int *out, int max, int &outLen)
+{
+  outLen = 0;
+  if (!root.containsKey("playlist"))
+    return false;
+  JsonVariantConst arrv = root["playlist"];
+  if (!arrv.is<JsonArrayConst>())
+    return false;
+
+  for (JsonVariantConst v : arrv.as<JsonArrayConst>())
+  {
+    int idx0 = -1;
+    if (v.is<int>())
+    {
+      int n = v.as<int>();
+      if (n >= 1 && n <= SOUND_COUNT)
+        idx0 = n - 1;
+    }
+    else if (v.is<const char *>())
+    {
+      idx0 = mapNameToIndex0(String(v.as<const char *>()));
+    }
+    else if (v.is<String>())
+    {
+      idx0 = mapNameToIndex0(v.as<String>());
+    }
+    if (idx0 >= 0 && idx0 < SOUND_COUNT)
+    {
+      if (outLen < max)
+      {
+        out[outLen++] = idx0;
+      }
+      else
+      {
+        Serial.println("Playlist truncated to MAX_PLAYLIST.");
+        break;
+      }
+    }
+  }
+  return outLen > 0;
+}
+
+void startPlaylist(const int *arr, int len, unsigned long delayMs, unsigned long firstDelayMs)
+{
+  audioStop();
+  mode = MODE_PLAYLIST;
+  userDelayMs = delayMs;
+
+  playlistLen = (len > MAX_PLAYLIST) ? MAX_PLAYLIST : len;
+  for (int i = 0; i < playlistLen; ++i)
+    playlist[i] = arr[i];
+  playlistPos = 0;
+
+  // CRITICAL FIX: If power is OFF, don't schedule immediately
+  if (!powerOn) {
+    hasSchedule = false;
+    publishStatus(String("mode:PLAYLIST_waiting_for_power len=") + playlistLen + " delay_ms=" + userDelayMs);
+    Serial.printf("PLAYLIST set but waiting for power ON (len=%d, delay_ms=%lu)\n", playlistLen, userDelayMs);
+    return;
+  }
+
+  scheduleIn(firstDelayMs);
+  publishStatus(String("mode:PLAYLIST_scheduled len=") + playlistLen + " delay_ms=" + userDelayMs);
+  Serial.printf("PLAYLIST scheduled (len=%d, first in %lu ms, repeat every %lu ms)\n",
+                playlistLen, firstDelayMs, userDelayMs);
+}
+
+void startSingleRepeat(int idx0, unsigned long delayMs, unsigned long firstDelayMs)
+{
+  if (idx0 < 0 || idx0 >= SOUND_COUNT)
+  {
+    publishStatus("invalid_play_index");
+    return;
+  }
+  audioStop();
+  mode = MODE_SINGLE_REPEAT;
+  singleIndex = idx0;
+  userDelayMs = delayMs;
+
+  // CRITICAL FIX: If power is OFF, don't schedule immediately
+  if (!powerOn) {
+    hasSchedule = false;
+    publishStatus(String("mode:SINGLE_waiting_for_power:") + SOUND_PATHS[idx0] + " delay_ms=" + userDelayMs);
+    Serial.printf("SINGLE set but waiting for power ON (%s, delay_ms=%lu)\n", SOUND_PATHS[idx0], userDelayMs);
+    return;
+  }
+
+  scheduleIn(firstDelayMs);
+  publishStatus(String("mode:SINGLE_scheduled:") + SOUND_PATHS[idx0] + " delay_ms=" + userDelayMs);
+  Serial.printf("SINGLE scheduled (%s, first in %lu ms, repeat every %lu ms)\n",
+                SOUND_PATHS[idx0], firstDelayMs, userDelayMs);
+}
+
+// ========================== MQTT handling (extended) ==========================
+void mqttMessageHandler(char *topic, byte *payload, unsigned int length)
+{
+  String msg;
+  msg.reserve(length);
+  for (unsigned int i = 0; i < length; ++i)
+    msg += (char)payload[i];
+
+  DynamicJsonDocument doc(3072);
+  DeserializationError error = deserializeJson(doc, msg);
+  if (error)
+  {
+    Serial.print("Deserialization failed: ");
+    Serial.println(error.c_str());
+    return;
+  }
+
+  JsonVariantConst root = doc.as<JsonVariantConst>();
+  String data = root["msg"] | "";
+  data.trim();
+  Serial.print("CMD: ");
+  Serial.println(data);
+
+  // POWER control: persistent ON/OFF, timed overrides, clear
+  if (data.equalsIgnoreCase("POWER")) {
+    unsigned long nowMs = millis();
+
+    // Timed overrides clear persistent override
+    if (root.containsKey("on_for_s")) {
+      long sec = root["on_for_s"].as<long>();
+      if (sec > 0) {
+        persistentOverride = OVR_NONE;
+        overrideOnUntilMs = nowMs + (unsigned long)sec * 1000UL;
+        overrideOffUntilMs = 0;
+        Serial.printf("POWER override: ON for %ld s\n", sec);
+      }
+    }
+    if (root.containsKey("off_for_s")) {
+      long sec = root["off_for_s"].as<long>();
+      if (sec > 0) {
+        persistentOverride = OVR_NONE;
+        overrideOffUntilMs = nowMs + (unsigned long)sec * 1000UL;
+        overrideOnUntilMs = 0;
+        Serial.printf("POWER override: OFF for %ld s\n", sec);
+      }
+    }
+
+    // Persistent state
+    if (root.containsKey("state")) {
+      String st = root["state"].as<const char*>();
+      st.toUpperCase();
+      overrideOnUntilMs = 0;
+      overrideOffUntilMs = 0;
+      if (st == "ON") {
+        persistentOverride = OVR_FORCE_ON;
+        powerOn = true; // immediate
+      } else if (st == "OFF") {
+        persistentOverride = OVR_FORCE_OFF;
+        powerOn = false; // immediate
+        if (isPlaying) audioStop();
+      }
+    }
+
+    // Clear persistent override (return to window/timed)
+    if (root["clear"] | false) {
+      persistentOverride = OVR_NONE;
+      Serial.println("POWER: persistent override cleared");
+    }
+
+    publishPowerStatus();
+    return;
+  }
+
+  // WINDOW daily schedule (IST local time) with days; accept "stop" alias
+  if (data.equalsIgnoreCase("WINDOW") || data.equalsIgnoreCase("WINDOW_OFF")) {
+    if (data.equalsIgnoreCase("WINDOW_OFF")) {
+      dailyWindow.enabled = false;
+      prefsSched.putBool("en", false);
+      publishStatus("window:disabled");
+      publishPowerStatus();
+      return;
+    }
+
+    bool touched = false;
+    if (root.containsKey("enabled")) {
+      dailyWindow.enabled = root["enabled"].as<bool>();
+      prefsSched.putBool("en", dailyWindow.enabled);
+      touched = true;
+    }
+
+    if (root.containsKey("start")) {
+      String s = root["start"].as<const char*>();
+      uint16_t m;
+      if (parseHHMM(s, m)) {
+        dailyWindow.startMin = m;
+        prefsSched.putUShort("start", m);
+        touched = true;
+      } else {
+        publishStatus("window:start_invalid");
+      }
+    }
+    if (root.containsKey("end") || root.containsKey("stop")) {
+      String s = root.containsKey("end") ? String(root["end"].as<const char*>())
+                                         : String(root["stop"].as<const char*>());
+      uint16_t m;
+      if (parseHHMM(s, m)) {
+        dailyWindow.endMin = m;
+        prefsSched.putUShort("end", m);
+        touched = true;
+      } else {
+        publishStatus("window:end_invalid");
+      }
+    }
+
+    if (root.containsKey("days")) {
+      uint8_t mask = 0;
+      if (root["days"].is<JsonArrayConst>()) {
+        mask = parseDaysMaskFromArray(root["days"]);
+      } else if (root["days"].is<const char*>() || root["days"].is<String>()) {
+        String ds = root["days"].is<const char*>() ? String(root["days"].as<const char*>()) : root["days"].as<String>();
+        mask = parseDaysMaskFromString(ds);
+      }
+      if (mask != 0) {
+        dailyWindow.daysMask = mask;
+        prefsSched.putUChar("days", mask);
+        touched = true;
+      } else {
+        publishStatus("window:days_invalid");
+      }
+    }
+
+    if (touched) {
+      if (!root.containsKey("enabled")) {
+        dailyWindow.enabled = true;
+        prefsSched.putBool("en", true);
+      }
+      publishStatus("window:updated");
+      publishPowerStatus();
+    }
+    return;
+  }
+
+  // STOP -> stop and cancel any schedule
+  if (data.equalsIgnoreCase("STOP"))
+  {
+    stopEverything();
+    return;
+  }
+
+  // START -> playlist with custom delay (first playback immediate by default)
+  if (data.equalsIgnoreCase("START"))
+  {
+    unsigned long newDelay = parseDelayMs(root, userDelayMs);
+    unsigned long firstDelay = root.containsKey("start_after_ms")
+                                   ? (unsigned long)root["start_after_ms"].as<long>()
+                                   : 0UL;
+
+    int tmp[MAX_PLAYLIST];
+    int len = 0;
+    if (!parsePlaylistJSON(root, tmp, MAX_PLAYLIST, len))
+    {
+      int def[MAX_PLAYLIST];
+      int defLen = SOUND_COUNT;
+      for (int i = 0; i < defLen; ++i)
+        def[i] = i;
+      startPlaylist(def, defLen, newDelay, firstDelay);
+    }
+    else
+    {
+      startPlaylist(tmp, len, newDelay, firstDelay);
+    }
+    return;
+  }
+
+  // PLAY1 / PLAY2 -> repeat that sound
+  if (data.equalsIgnoreCase("PLAY1") || data.equalsIgnoreCase("PLAY2"))
+  {
+    int idx0 = data.endsWith("1") ? 0 : 1;
+    unsigned long newDelay = parseDelayMs(root, userDelayMs);
+    unsigned long firstDelay = root.containsKey("start_after_ms")
+                                   ? (unsigned long)root["start_after_ms"].as<long>()
+                                   : 0UL;
+    startSingleRepeat(idx0, newDelay, firstDelay);
+    return;
+  }
+
+  // DELAY: update delay
+  if (data.equalsIgnoreCase("DELAY"))
+  {
+    unsigned long newDelay = parseDelayMs(root, userDelayMs);
+    if (newDelay > 0)
+    {
+      userDelayMs = newDelay;
+      publishStatus(String("delay_ms:") + userDelayMs);
+      bool resched = root["reschedule"] | false;
+      if (!isPlaying && (mode != MODE_IDLE) && resched)
+      {
+        scheduleIn(0);
+        publishStatus("rescheduled_next_immediate");
+      }
+    }
+    return;
+  }
+
+  // VOLUME
+  if (data.equalsIgnoreCase("VOLUME") && out)
+  {
+    float v = root["val"] | 0.5f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    out->SetGain(v);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "volume:%.2f", v);
+    publishStatus(buf);
+    Serial.printf("Volume set to %.2f\n", v);
+    return;
+  }
+
+  // STATUS
+  if (data.equalsIgnoreCase("STATUS"))
+  {
+    long nextRemain = msUntilNext();
+    char sBuf[6], eBuf[6];
+    hhmmFromMin(dailyWindow.startMin, sBuf);
+    hhmmFromMin(dailyWindow.endMin, eBuf);
+
+    const char* ovr =
+      (persistentOverride == OVR_FORCE_ON)  ? "PERSIST_ON" :
+      (persistentOverride == OVR_FORCE_OFF) ? "PERSIST_OFF" : "NONE";
+
+    String s = String("status:{mode:") + modeName(mode) +
+               ", power:" + (powerOn ? "ON" : "OFF") +
+               ", playing:" + (isPlaying ? "YES" : "NO") +
+               ", file:" + (currentFile.length() ? currentFile : String("-")) +
+               ", delay_ms:" + userDelayMs +
+               ", next_ms:" + (nextRemain >= 0 ? String(nextRemain) : String(-1)) +
+               ", playlist_len:" + playlistLen +
+               ", window_en:" + (dailyWindow.enabled ? "1" : "0") +
+               ", window:" + sBuf + "-" + eBuf +
+               ", days:" + daysMaskToString(dailyWindow.daysMask) +
+               ", override:" + ovr + "}";
+    publishStatus(s);
+    return;
+  }
+
+  Serial.println("Unknown command.");
+}
+
+bool connectMQTT()
+{
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setCallback(mqttMessageHandler);
+
+  uint64_t mac = ESP.getEfuseMac();
+  clientId = "esp32-" + String((uint32_t)(mac >> 32), HEX) + String((uint32_t)mac, HEX);
+
+  Serial.print("MQTT: connecting to ");
+  Serial.print(MQTT_HOST);
+  Serial.print(":");
+  Serial.print(MQTT_PORT);
+  Serial.print(" as ");
+  Serial.println(clientId);
+
+  bool ok = false;
+  if (strlen(MQTT_USER))
+  {
+    ok = mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASS, TOPIC_STATUS, 1, true, LWT_OFFLINE);
+  }
+  else
+  {
+    ok = mqtt.connect(clientId.c_str(), TOPIC_STATUS, 1, true, LWT_OFFLINE);
+  }
+
+  if (ok)
+  {
+    Serial.println("MQTT connected.");
+    mqtt.publish(TOPIC_STATUS, ONLINE_MSG, true);
+    mqtt.subscribe(TOPIC_CMD, 1);
+  }
+  else
+  {
+    Serial.print("MQTT connect failed, rc=");
+    Serial.println(mqtt.state());
+  }
+  return ok;
+}
+
+void ensureMQTT()
+{
+  if (!WiFi.isConnected()) return;
+  if (apRunning) return;
+  if (mqtt.connected()) return;
+
+  for (int i = 0; i < 10 && !mqtt.connected(); ++i)
+  {
+    if (connectMQTT()) break;
+    Serial.println("Retry MQTT in 2s...");
+    delay(2000);
+  }
+  if (!mqtt.connected())
+  {
+    Serial.println("MQTT still not connected, rebooting...");
+    delay(1500);
+    ESP.restart();
+  }
+}
+
+// ========================== Captive portal HTML ==========================
+String htmlIndex()
+{
+  String page = R"====(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>ESP32 Wi-Fi Setup</title>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:16px;color:#222}
+  .card{max-width:520px;margin:auto;border:1px solid #ddd;border-radius:8px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,.05)}
+  h1{font-size:20px;margin:0 0 12px}
+  label{display:block;margin:10px 0 6px}
+  input,select,button{width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;font-size:14px}
+  button{background:#2d6cdf;color:#fff;border:none;cursor:pointer;margin-top:12px}
+  button:disabled{opacity:.6;cursor:not-allowed}
+  .netlist{margin:10px 0 0}
+  .small{font-size:12px;color:#555}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>ESP32 Wi‑Fi Setup</h1>
+  <p>Set your Wi-Fi SSID and password. You can click on "Scan Networks" to view the available SSIDs.</p>
+
+  <label for="ssid">SSID</label>
+  <input id="ssid" name="ssid" placeholder="Wi‑Fi Network Name" />
+
+  <label for="pass">Password</label>
+  <input id="pass" name="pass" type="password" placeholder="Wi‑Fi Password" />
+
+  <button id="btnSave">Save & Connect</button>
+  <button id="btnScan" style="background:#444">Scan Networks</button>
+
+  <div id="networks" class="netlist"></div>
+</div>
+
+<script>
+const $ = sel => document.querySelector(sel);
+
+$("#btnScan").onclick = async () => {
+  $("#btnScan").disabled = true;
+  $("#networks").innerHTML = "Scanning...";
+  try {
+    const res = await fetch("/scan");
+    const data = await res.json();
+    if (!Array.isArray(data)) throw new Error("Invalid scan data");
+    if (data.length === 0) {
+      $("#networks").innerHTML = "No networks found.";
+    } else {
+      $("#networks").innerHTML = data.map(n => 
+        `<div>
+          <button onclick="document.getElementById('ssid').value='${n.ssid.replace(/'/g, "\\'")}'">
+            ${n.ssid} (RSSI: ${n.rssi}${n.secure? ', Secured':''})
+          </button>
+        </div>`
+      ).join("");
+    }
+  } catch (e) {
+    $("#networks").innerHTML = "Scan failed.";
+  }
+  $("#btnScan").disabled = false;
+};
+
+$("#btnSave").onclick = async () => {
+  const ssid = $("#ssid").value.trim();
+  const pass = $("#pass").value;
+  if (!ssid) { alert("SSID required"); return; }
+  $("#btnSave").disabled = true;
+  try {
+    const form = new URLSearchParams({ ssid, pass });
+    const res = await fetch("/save", { method:"POST", headers:{ "Content-Type":"application/x-www-form-urlencoded" }, body:form });
+    const text = await res.text();
+    document.body.innerHTML = text;
+  } catch (e) {
+    alert("Request failed");
+  }
+  $("#btnSave").disabled = false;
+};
+</script>
+</body>
+</html>)====";
+  return page;
+}
+
+String htmlResult(const String &msg)
+{
+  String page = "<!DOCTYPE html><html><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><body style='font-family:system-ui; padding:16px;'>";
+  page += "<h2>" + msg + "</h2>";
+  page += "<p>If connected, disconnect from this AP and connect back to your Wi‑Fi. See Serial Monitor for IP.</p>";
+  page += "</body></html>";
+  return page;
+}
+
+// ========================== Wi‑Fi connect + AP control ==========================
+bool connectToWiFi(const String &ssid, const String &pwd, uint32_t timeoutMs = 15000)
+{
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), pwd.c_str());
+  Serial.printf("Connecting to SSID: %s\n", ssid.c_str());
+
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeoutMs)
+  {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.print("WiFi connected. IP: ");
+    Serial.println(WiFi.localIP());
+    return true;
+  }
+  else
+  {
+    Serial.println("WiFi connect failed or timeout.");
+    return false;
+  }
+}
+
+void stopAP()
+{
+  if (!apRunning)
+    return;
+  dnsServer.stop();
+  server.stop();
+  WiFi.softAPdisconnect(true);
+  apRunning = false;
+  Serial.println("AP stopped.");
+}
+
+void startAP()
+{
+  Serial.println("Starting Access Point for setup...");
+  WiFi.mode(WIFI_AP_STA); // allow STA connection when credentials saved
+  WiFi.softAPConfig(apIP, apGateway, apSubnet);
+  bool apok = WiFi.softAP(AP_SSID, AP_PASS);
+  if (!apok)
+  {
+    Serial.println("AP start failed, retrying without password...");
+    WiFi.softAP(AP_SSID);
+  }
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // DNS captive portal: redirect all domains to AP IP
+  dnsServer.start(DNS_PORT, "*", apIP);
+
+  // HTTP routes
+  server.onNotFound([]()
+                    { server.send(200, "text/html", htmlIndex()); });
+  server.on("/", HTTP_GET, []()
+            { server.send(200, "text/html", htmlIndex()); });
+  server.on("/scan", HTTP_GET, []()
+            {
+    int n = WiFi.scanNetworks();
+    if (n == WIFI_SCAN_FAILED)
+    {
+      WiFi.disconnect();
+      n = WiFi.scanNetworks(); // Retry scan after disconnect
+    }
+    String json = "[";
+    for (int i = 0; i < n; i++) {
+      if (i) json += ",";
+      json += "{";
+      json += "\"ssid\":\"" + String(WiFi.SSID(i)) + "\",";
+      json += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
+      json += "\"secure\":" + String(WiFi.encryptionType(i) != WIFI_AUTH_OPEN ? "true" : "false");
+      json += "}";
+    }
+    json += "]";
+    WiFi.scanDelete();
+    server.send(200, "application/json", json); });
+  server.on("/save", HTTP_POST, []()
+            {
+    if (!server.hasArg("ssid")) {
+      server.send(400, "text/plain", "Missing ssid");
+      return;
+    }
+    String ssid = server.arg("ssid");
+    String pwd  = server.hasArg("pass") ? server.arg("pass") : "";
+
+    // Save to NVS
+    prefs.putString("ssid", ssid);
+    prefs.putString("pass", pwd);
+
+    // Try connecting
+    bool ok = connectToWiFi(ssid, pwd, 18000);
+
+    if (ok) {
+      String msg = "Saved and connected to " + ssid + "<br>ESP32 IP: " + WiFi.localIP().toString();
+      server.send(200, "text/html", htmlResult(msg));
+      delay(500);
+      stopAP();                   // stop AP so clients return to router
+      mqttConnectPending = true;  // connect MQTT soon
+      timeSyncPending = true;     // run time sync soon
+    } else {
+      String msg = "Saved, but connection failed. Verify SSID/Password and try again.";
+      server.send(200, "text/html", htmlResult(msg));
+    } });
+
+  server.begin();
+  apRunning = true;
+  Serial.println("Captive portal WebServer started.");
+}
+
+// ========================== Setup/Loop ==========================
+void setup()
+{
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+  pinMode(ADC_PIN, INPUT);
+
+  Serial.begin(115200);
+  while (!Serial && millis() < 1500) { }
+
+  // Mount SPIFFS
+  if (!SPIFFS.begin(true))
+  {
+    Serial.println("SPIFFS mount failed!");
+  }
+  else
+  {
+    Serial.println("SPIFFS mounted.");
+  }
+
+  // Load saved Wi‑Fi credentials
+  prefs.begin("wifi", false);
+  String savedSsid = prefs.getString("ssid", "");
+  String savedPwd = prefs.getString("pass", "");
+
+  // Load power window settings
+  prefsSched.begin("sched", false);
+  dailyWindow.enabled  = prefsSched.getBool("en", false);
+  dailyWindow.startMin = prefsSched.getUShort("start", 8*60);
+  dailyWindow.endMin   = prefsSched.getUShort("end", 18*60);
+  dailyWindow.daysMask = prefsSched.getUChar("days", DAYS_ALL);
+
+  if (savedSsid.length() > 0)
+  {
+    Serial.printf("Found saved SSID: %s\n", savedSsid.c_str());
+    if (connectToWiFi(savedSsid, savedPwd))
+    {
+      (void)syncTimeIfNeeded(true);
+      ensureMQTT();
+    }
+    else
+    {
+      Serial.println("Saved Wi‑Fi connect failed, starting AP for reconfiguration...");
+      startAP();
+    }
+  }
+  else
+  {
+    Serial.println("No saved Wi‑Fi credentials, starting AP...");
+    startAP();
+  }
+
+  // Initialize power state report
+  applyPowerTransitionIfNeeded();
+  publishPowerStatus();
+}
+
+void loop()
+{
+  // Keep captive portal responsive if AP is running
+  if (apRunning)
+  {
+    dnsServer.processNextRequest();
+    server.handleClient();
+  }
+
+  // After portal save, connect MQTT and sync time
+  if (WiFi.isConnected() && !apRunning)
+  {
+    if (mqttConnectPending) {
+      mqttConnectPending = false;
+      ensureMQTT();
+    }
+    if (timeSyncPending) {
+      timeSyncPending = false;
+      (void)syncTimeIfNeeded(true);
+    }
+  }
+
+  // Periodic time printing and re-sync checks
+  if (millis() - lastPrintMs >= 1000) {
+    lastPrintMs = millis();
+    printNowIST();
+  }
+  if (millis() - lastResyncCheckMs >= 10000) {
+    lastResyncCheckMs = millis();
+    (void)syncTimeIfNeeded(false);
+  }
+
+  // MQTT service
+  if (WiFi.isConnected())
+  {
+    if (!mqtt.loop())
+      ensureMQTT();
+  }
+
+  // Update power state (overrides/window)
+  applyPowerTransitionIfNeeded();
+
+  // If power is OFF and something is playing, stop it
+  if (!powerOn && isPlaying) {
+    audioStop();
+  }
+
+  // CRITICAL FIX: If power just turned ON and mode is not IDLE but no schedule, start scheduling
+  if (powerOn && !isPlaying && !hasSchedule && mode != MODE_IDLE) {
+    Serial.println("Power ON detected with active mode but no schedule - starting now");
+    scheduleIn(0); // Schedule immediate playback
+  }
+
+  // Drive audio playback non-blocking
+  if (powerOn && wav && wav->isRunning())
+  {
+    if (!wav->loop())
+    {
+      wav->stop();
+      audioCleanup();
+      isPlaying = false;
+      String s = String("completed:") + currentFile;
+      currentFile = "";
+      digitalWrite(LED_BUILTIN, LOW);
+      publishStatus(s);
+
+      if (mode == MODE_PLAYLIST)
+      {
+        scheduleIn(userDelayMs);
+        publishStatus("scheduled_next:playlist");
+      }
+      else if (mode == MODE_SINGLE_REPEAT)
+      {
+        scheduleIn(userDelayMs);
+        publishStatus("scheduled_next:single");
+      }
+    }
+  }
+
+  // If nothing is playing and a start is scheduled, begin only when power is ON
+  if (powerOn && !isPlaying && hasSchedule && timeReached(nextStartAt))
+  {
+    const char *path = nullptr;
+    if (mode == MODE_PLAYLIST)
+    {
+      if (playlistLen > 0)
+      {
+        int idx0 = playlist[playlistPos];
+        playlistPos = (playlistPos + 1) % playlistLen;
+        if (idx0 >= 0 && idx0 < SOUND_COUNT)
+          path = SOUND_PATHS[idx0];
+      }
+    }
+    else if (mode == MODE_SINGLE_REPEAT)
+    {
+      if (singleIndex >= 0 && singleIndex < SOUND_COUNT)
+        path = SOUND_PATHS[singleIndex];
+    }
+
+    if (path)
+    {
+      hasSchedule = false; // consume schedule
+      if (!audioStart(path))
+      {
+        scheduleIn(userDelayMs);
+        publishStatus("play_start_failed_rescheduled");
+      }
+    }
+    else
+    {
+      stopEverything();
+    }
+  }
+
+  // Telemetry
+  unsigned long now = millis();
+  if (now - lastPub >= PUBLISH_INTERVAL_MS)
+  {
+    lastPub = now;
+
+    int adcRaw = analogRead(ADC_PIN);
+    long nextRemain = msUntilNext();
+    char sBuf[6], eBuf[6];
+    hhmmFromMin(dailyWindow.startMin, sBuf);
+    hhmmFromMin(dailyWindow.endMin, eBuf);
+
+    long oOn  = overrideOnUntilMs  ? (long)(overrideOnUntilMs  - (long)millis()) : 0;
+    long oOff = overrideOffUntilMs ? (long)(overrideOffUntilMs - (long)millis()) : 0;
+
+    const char* ovr =
+      (persistentOverride == OVR_FORCE_ON)  ? "PERSIST_ON" :
+      (persistentOverride == OVR_FORCE_OFF) ? "PERSIST_OFF" : "NONE";
+
+    String payload = String("{\"uptime_ms\":") + now +
+                     ",\"rssi\":" + WiFi.RSSI() +
+                     ",\"heap\":" + ESP.getFreeHeap() +
+                     ",\"adc34\":" + adcRaw +
+                     ",\"power\":\"" + (powerOn ? "ON" : "OFF") + "\"" +
+                     ",\"win_en\":" + (dailyWindow.enabled ? "true" : "false") +
+                     ",\"win_start\":\"" + String(sBuf) + "\"" +
+                     ",\"win_end\":\"" + String(eBuf) + "\"" +
+                     ",\"win_days\":\"" + daysMaskToString(dailyWindow.daysMask) + "\"" +
+                     ",\"override\":\"" + ovr + "\"" +
+                     ",\"ovr_on_ms\":" + (oOn > 0 ? oOn : 0) +
+                     ",\"ovr_off_ms\":" + (oOff > 0 ? oOff : 0) +
+                     ",\"playing\":\"" + (isPlaying ? "YES" : "NO") + "\"" +
+                     (currentFile.length() ? String(",\"file\":\"") + currentFile + "\"" : String()) +
+                     String(",\"mode\":\"") + modeName(mode) + "\"" +
+                     String(",\"delay_ms\":") + userDelayMs +
+                     (nextRemain >= 0 ? String(",\"next_ms\":") + nextRemain : String()) +
+                     ",\"playlist_len\":" + playlistLen +
+                     "}";
+
+    if (mqtt.connected())
+    {
+      bool ok = mqtt.publish(TOPIC_TELEMETRY, payload.c_str(), false);
+      Serial.print("MQTT -> [");
+      Serial.print(TOPIC_TELEMETRY);
+      Serial.print("] ");
+      Serial.println(ok ? payload : "publish failed");
+    }
+    else
+    {
+      Serial.print("TEL: ");
+      Serial.println(payload);
+    }
+  }
+}
