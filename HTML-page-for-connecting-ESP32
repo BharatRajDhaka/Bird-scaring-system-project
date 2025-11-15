@@ -1,0 +1,758 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ESP32 Bird Sound Control</title>
+  <link rel="preconnect" href="https://unpkg.com">
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <style>
+    :root {
+      --bg: #0c0d10;
+      --card: #14161b;
+      --line: #23262d;
+      --text: #e6e8ef;
+      --muted: #9aa3b2;
+      --accent: #2d6cdf;
+      --accent-2: #18a957;
+      --warn: #c0392b;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      --radius: 10px;
+      --pad: 14px;
+    }
+
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f7f8fa;
+        --card: #fff;
+        --line: #e8ebf0;
+        --text: #1f2328;
+        --muted: #5b626e;
+      }
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    .wrap {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 24px 16px 40px;
+    }
+
+    header {
+      margin-bottom: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    header h1 {
+      font-size: 20px;
+      margin: 0;
+    }
+
+    .hint {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1.2fr 1fr;
+      gap: 16px;
+    }
+
+    @media (max-width:980px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: var(--pad);
+    }
+
+    .card h2 {
+      font-size: 16px;
+      margin: 0 0 12px;
+    }
+
+    .row {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(12, 1fr);
+    }
+
+    .col-12 {
+      grid-column: span 12
+    }
+
+    .col-10 {
+      grid-column: span 10
+    }
+
+    .col-8 {
+      grid-column: span 8
+    }
+
+    .col-6 {
+      grid-column: span 6
+    }
+
+    .col-4 {
+      grid-column: span 4
+    }
+
+    .col-3 {
+      grid-column: span 3
+    }
+
+    .col-2 {
+      grid-column: span 2
+    }
+
+    @media (max-width:720px) {
+
+      .col-10,
+      .col-8,
+      .col-6,
+      .col-4,
+      .col-3,
+      .col-2 {
+        grid-column: span 12;
+      }
+    }
+
+    label {
+      font-size: 12px;
+      color: var(--muted);
+      display: block;
+      margin-bottom: 6px;
+    }
+
+    input,
+    select,
+    .chips {
+      width: 100%;
+      border: 1px solid var(--line);
+      background: transparent;
+      color: var(--text);
+      padding: 10px;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+
+    select {
+      color-scheme: dark;
+      background-color: var(--card);
+      color: var(--text);
+      border: 1px solid var(--line);
+    }
+
+    option {
+      background-color: #0a0b0e;
+      color: #e6e8ef;
+    }
+
+    select:focus,
+    input:focus {
+      outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent);
+      outline-offset: 2px;
+    }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 8px;
+    }
+
+    .chip {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 12px;
+      cursor: pointer;
+      color: var(--muted);
+      user-select: none;
+    }
+
+    .chip.active {
+      border-color: var(--accent);
+      color: var(--text);
+      background: color-mix(in srgb, var(--accent) 14%, transparent);
+    }
+
+    .btn {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 10px 14px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+
+    .btn:disabled {
+      opacity: .6;
+      cursor: not-allowed;
+    }
+
+    .btn.secondary {
+      background: #4c5565;
+    }
+
+    .btn.success {
+      background: var(--accent-2);
+    }
+
+    .btn.warn {
+      background: var(--warn);
+    }
+
+    .btn.ghost {
+      background: transparent;
+      color: var(--muted);
+      border: 1px dashed var(--line);
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 12px;
+      border: 1px solid var(--line);
+      background: #0f1218;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #999;
+    }
+
+    .dot.ok {
+      background: #22c55e;
+    }
+
+    .stack {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .between {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .mono {
+      font-family: var(--mono);
+    }
+
+    #log,
+    #live {
+      overflow: auto;
+      white-space: pre-wrap;
+      background: #0a0b0e;
+      border-radius: 8px;
+      padding: 10px;
+      border: 1px solid var(--line);
+    }
+
+    #log {
+      height: 140px;
+    }
+
+    #log.expanded {
+      height: 280px;
+    }
+
+    #live {
+      height: 260px;
+    }
+
+    .controls-bar {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+    }
+
+    .switch {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .switch input {
+      width: auto;
+    }
+
+    .banner {
+      margin: 10px 0;
+      padding: 10px;
+      border-radius: 8px;
+      background: #231818;
+      color: #ffd9d9;
+      border: 1px solid #442222;
+      font-size: 13px;
+      display: none;
+    }
+
+    .tip {
+      margin-top: 8px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <header>
+      <h1>ESP32 Bird Sound Control</h1>
+      <div class="hint">Browsers need MQTT over WebSockets. Mosquitto: ws 9001 path “/”. EMQX: ws 8083 path “/mqtt”.
+      </div>
+    </header>
+
+    <div class="grid">
+      <div class="card">
+        <div class="between" style="margin-bottom:10px">
+          <h2>MQTT Connection</h2>
+          <span class="badge"><span id="dot" class="dot"></span><span id="connText">Disconnected</span></span>
+        </div>
+
+        <div id="wsWarning" class="banner">
+          1883 is MQTT/TCP and won’t work from a web page. Use your WebSocket port (e.g., 9001) and the correct path
+          (Mosquitto “/”, EMQX “/mqtt”).
+        </div>
+
+        <div class="row">
+          <div class="col-2">
+            <label>Protocol</label>
+            <select id="proto">
+              <option value="ws">ws</option>
+              <option value="wss">wss</option>
+            </select>
+          </div>
+          <div class="col-8">
+            <label>Host</label>
+            <input id="host" type="text" placeholder="192.168.10.41" />
+          </div>
+          <div class="col-2">
+            <label>Port (WS)</label>
+            <input id="port" type="number" placeholder="8083 / 9001" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="col-3">
+            <label>Path</label>
+            <input id="path" type="text" value="/" />
+          </div>
+          <div class="col-3">
+            <label>MQTT Version</label>
+            <select id="mqttver">
+              <option value="4" selected>3.1.1</option>
+              <option value="5">5.0</option>
+            </select>
+          </div>
+          <div class="col-6">
+            <label>Client ID</label>
+            <input id="clientId" type="text" placeholder="auto if empty" />
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="col-4">
+            <label>Username</label>
+            <input id="user" type="text" placeholder="engineer" />
+          </div>
+          <div class="col-4">
+            <label>Password</label>
+            <input id="pass" type="password" />
+          </div>
+          <div class="col-4"></div>
+        </div>
+
+        <div class="row">
+          <div class="col-4">
+            <label>Command topic</label>
+            <input id="cmdTopic" type="text" value="test" />
+          </div>
+          <div class="col-4">
+            <label>Status topic</label>
+            <input id="statusTopic" type="text" value="esp32/demo/status" />
+          </div>
+          <div class="col-4">
+            <label>Telemetry topic</label>
+            <input id="teleTopic" type="text" value="esp32/demo/telemetry" />
+          </div>
+        </div>
+
+        <div class="between" style="margin-top:12px">
+          <div class="stack">
+            <button id="btnConnect" class="btn">Connect</button>
+            <button id="btnDisconnect" class="btn secondary" disabled>Disconnect</button>
+            <button id="presetMosq" class="btn ghost">Preset: Mosquitto</button>
+            <button id="presetEmqx" class="btn ghost">Preset: EMQX</button>
+          </div>
+          <small class="hint">If this page is https://, use wss and a TLS listener.</small>
+        </div>
+
+        <div class="card" style="margin-top:12px">
+          <div class="between">
+            <h3 style="margin:0;font-size:14px;">Console</h3>
+            <div class="stack">
+              <label class="switch"><input type="checkbox" id="logMuteTele" checked> Mute telemetry</label>
+              <label class="switch"><input type="checkbox" id="logCompact" checked> Compact</label>
+              <label class="switch"><input type="checkbox" id="logAutoscroll" checked> Auto‑scroll</label>
+              <button id="logClear" class="btn secondary" style="padding:6px 10px">Clear</button>
+              <button id="logExpand" class="btn secondary" style="padding:6px 10px">Expand</button>
+            </div>
+          </div>
+          <div id="log" class="mono" style="margin-top:8px">—</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="between" style="margin-bottom:10px">
+          <h2>Live Status</h2>
+          <div class="stack">
+            <label class="switch"><input type="checkbox" id="prettyLive" checked> Pretty JSON</label>
+            <button id="btnStatus" class="btn secondary">STATUS</button>
+            <button id="liveClear" class="btn secondary">Clear</button>
+          </div>
+        </div>
+        <div id="live" class="mono">—</div>
+        <div class="tip">Shows the latest message from status or telemetry topics.</div>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top:16px">
+      <div class="card">
+        <h2>Power</h2>
+        <div class="stack" style="margin-bottom:10px">
+          <button id="pOn" class="btn success">Persistent ON</button>
+          <button id="pOff" class="btn warn">Persistent OFF</button>
+          <button id="pClear" class="btn secondary">Clear Persistent</button>
+        </div>
+        <div class="row">
+          <div class="col-3">
+            <label>ON for (sec)</label>
+            <input id="onSecs" type="number" min="1" placeholder="600" />
+          </div>
+          <div class="col-3">
+            <label>&nbsp;</label>
+            <button id="btnOnSecs" class="btn" style="width:100%">Send ON override</button>
+          </div>
+          <div class="col-3">
+            <label>OFF for (sec)</label>
+            <input id="offSecs" type="number" min="1" placeholder="300" />
+          </div>
+          <div class="col-3">
+            <label>&nbsp;</label>
+            <button id="btnOffSecs" class="btn warn" style="width:100%">Send OFF override</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Window (IST) + Days</h2>
+        <div class="row">
+          <div class="col-6">
+            <label>Start</label>
+            <input id="winStart" type="time" step="60" placeholder="HH:MM" />
+          </div>
+          <div class="col-6">
+            <label>End</label>
+            <input id="winEnd" type="time" step="60" placeholder="HH:MM" />
+          </div>
+          <div class="col-12">
+            <label>Days</label>
+            <div id="days" class="chips">
+              <span data-day="Sun" class="chip">Sun</span><span data-day="Mon" class="chip">Mon</span><span
+                data-day="Tue" class="chip">Tue</span><span data-day="Wed" class="chip">Wed</span><span data-day="Thu"
+                class="chip">Thu</span><span data-day="Fri" class="chip">Fri</span><span data-day="Sat"
+                class="chip">Sat</span>
+            </div>
+          </div>
+          <div class="col-12 between">
+            <div class="stack">
+              <button id="daysAll" class="btn secondary">All</button>
+              <button id="daysWeekdays" class="btn secondary">Weekdays</button>
+              <button id="daysWeekend" class="btn secondary">Weekend</button>
+            </div>
+            <div class="stack">
+              <button id="winSend" class="btn">Set Window</button>
+              <button id="winDisable" class="btn secondary">Disable Window</button>
+            </div>
+          </div>
+        </div>
+        <div class="tip">Overnight windows (e.g., 20:00–06:00) are supported.</div>
+      </div>
+
+      <div class="card">
+        <h2>Playlist</h2>
+        <div class="row">
+          <div class="col-8">
+            <label>Items (comma-separated)</label>
+            <input id="playlist" type="text" placeholder="play1, play2" />
+          </div>
+          <div class="col-2">
+            <label>Delay (s)</label>
+            <input id="delayS" type="number" min="1" value="60" />
+          </div>
+          <div class="col-2">
+            <label>Start after (ms)</label>
+            <input id="startAfter" type="number" min="0" value="0" />
+          </div>
+          <div class="col-12 between" style="margin-top:6px">
+            <div class="stack">
+              <button id="plStart" class="btn">START Playlist</button>
+              <button id="plStop" class="btn secondary">STOP</button>
+            </div>
+            <small class="hint">Allowed: 1,2 or play1,play2 or gunshot,eagle</small>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Single Repeat + Delay</h2>
+        <div class="row">
+          <div class="col-4">
+            <label>Repeat delay (s)</label>
+            <input id="singleDelayS" type="number" min="1" value="30" />
+          </div>
+          <div class="col-8 stack" style="align-items:end">
+            <button id="play1" class="btn">PLAY1 repeat</button>
+            <button id="play2" class="btn">PLAY2 repeat</button>
+          </div>
+          <div class="col-4">
+            <label>Change delay (s)</label>
+            <input id="newDelayS" type="number" min="1" />
+          </div>
+          <div class="col-8" style="display:flex; align-items:end; justify-content:flex-start">
+            <button id="btnDelay" class="btn secondary">Apply DELAY</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Volume</h2>
+        <div class="between">
+          <input id="vol" type="range" min="0" max="100" value="50" style="flex:1" />
+          <span id="volVal" class="mono">50%</span>
+          <button id="volSend" class="btn secondary">Send</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="tip" style="margin-top:14px">
+      Quick guide: Mosquitto WS → ws://IP:9001/ (Path “/”), MQTT 3.1.1. EMQX WS → ws://IP:8083/mqtt (Path “/mqtt”), MQTT
+      5.
+    </div>
+  </div>
+
+  <script>
+    let client = null;
+    const $ = (sel) => document.querySelector(sel);
+    const logEl = $("#log"), liveEl = $("#live");
+    const connDot = $("#dot"), connText = $("#connText");
+    const wsWarning = $("#wsWarning");
+
+    function shouldAutoscroll(el) { return $("#logAutoscroll").checked && (el.scrollTop + el.clientHeight >= el.scrollHeight - 2); }
+    function doAutoscroll(el, wasBottom) { if (wasBottom) el.scrollTop = el.scrollHeight; }
+    function log(msg) {
+      const time = new Date().toLocaleTimeString();
+      const wasBottom = shouldAutoscroll(logEl);
+      const compact = $("#logCompact").checked;
+      const line = compact && msg.length > 220 ? msg.slice(0, 217) + "..." : msg;
+      const out = `[${time}] ${line}`;
+      if (logEl.textContent === "—") logEl.textContent = out;
+      else logEl.textContent += `\n${out}`;
+      doAutoscroll(logEl, wasBottom);
+    }
+    function setConnected(ok) { connDot.className = "dot " + (ok ? "ok" : ""); connText.textContent = ok ? "Connected" : "Disconnected"; $("#btnConnect").disabled = ok; $("#btnDisconnect").disabled = !ok; }
+    function parseJSONSafe(s) { try { return JSON.parse(s); } catch { return null; } }
+    function showWsWarningIfNeeded() {
+      const port = parseInt($("#port").value || "0", 10);
+      const path = ($("#path").value || "").trim();
+      wsWarning.style.display = (port === 1883 || path === "") ? "block" : "none";
+    }
+
+    const fields = ["proto", "host", "port", "path", "mqttver", "clientId", "user", "cmdTopic", "statusTopic", "teleTopic"];
+    fields.forEach(id => {
+      const el = $("#" + id); const v = localStorage.getItem("ui_" + id);
+      if (v !== null) el.value = v;
+      el.addEventListener("change", () => { localStorage.setItem("ui_" + id, el.value); showWsWarningIfNeeded(); });
+    });
+    (function defaults() {
+      if (!localStorage.getItem("ui_port")) $("#port").value = "9001";
+      if (!localStorage.getItem("ui_path")) $("#path").value = "/";
+      if (!localStorage.getItem("ui_proto")) $("#proto").value = "ws";
+      if (!localStorage.getItem("ui_mqttver")) $("#mqttver").value = "4";
+    })();
+    showWsWarningIfNeeded();
+
+    function connect() {
+      const proto = $("#proto").value || "ws";
+      const host = $("#host").value.trim();
+      const port = parseInt($("#port").value || "0", 10);
+      let path = $("#path").value.trim() || "/";
+      if (!path.startsWith("/")) path = "/" + path;
+      const mqttver = parseInt($("#mqttver").value || "4", 10);
+      const clientId = $("#clientId").value.trim() || ("web-" + Math.random().toString(16).slice(2));
+      const username = $("#user").value.trim();
+      const password = $("#pass").value;
+
+      if (!host || !port) { alert("Host and WebSocket port required"); return; }
+      const url = `${proto}://${host}:${port}${path}`;
+      const opts = { clientId, clean: true, reconnectPeriod: 2000, protocolVersion: mqttver, connectTimeout: 10000 };
+      if (username) opts.username = username;
+      if (password) opts.password = password;
+
+      log(`Connecting to ${url} (MQTT v${mqttver}) ...`);
+      client = mqtt.connect(url, opts);
+
+      client.on("connect", () => {
+        setConnected(true);
+        log(`Connected as ${clientId}`);
+        const st = $("#statusTopic").value.trim();
+        const tt = $("#teleTopic").value.trim();
+        if (st) client.subscribe(st, { qos: 1 }, (err) => log(err ? `SUB error ${st}` : `SUB ${st}`));
+        if (tt) client.subscribe(tt, { qos: 0 }, (err) => log(err ? `SUB error ${tt}` : `SUB ${tt}`));
+      });
+      client.on("close", () => { setConnected(false); log("Disconnected"); });
+      client.on("reconnect", () => { log("Reconnecting..."); });
+      client.on("error", (e) => { log("Error: " + (e?.message || e)); });
+
+      client.on("message", (topic, payloadBuf) => {
+        const payload = payloadBuf.toString();
+        const pretty = $("#prettyLive").checked;
+        const obj = parseJSONSafe(payload);
+        $("#live").textContent = pretty && obj ? JSON.stringify(obj, null, 2) : (obj ? JSON.stringify(obj) : payload);
+
+        const muteTele = $("#logMuteTele").checked;
+        const teleTopic = $("#teleTopic").value.trim();
+        if (muteTele && teleTopic && topic === teleTopic) return;
+        log(`MSG ${topic} ${payload}`);
+      });
+    }
+    function disconnect() {
+      if (client) { client.end(true, {}, () => log("Closed connection")); client = null; setConnected(false); }
+    }
+
+    $("#btnConnect").addEventListener("click", connect);
+    $("#btnDisconnect").addEventListener("click", disconnect);
+    $("#presetMosq").addEventListener("click", () => {
+      $("#proto").value = (location.protocol === "https:") ? "wss" : "ws";
+      $("#port").value = "9001";
+      $("#path").value = "/";
+      $("#mqttver").value = "4";
+      showWsWarningIfNeeded();
+    });
+    $("#presetEmqx").addEventListener("click", () => {
+      $("#proto").value = (location.protocol === "https:") ? "wss" : "ws";
+      $("#port").value = ($("#proto").value === "wss") ? "8084" : "8083";
+      $("#path").value = "/mqtt";
+      $("#mqttver").value = "5";
+      showWsWarningIfNeeded();
+    });
+
+    $("#logClear").addEventListener("click", () => { logEl.textContent = "—"; });
+    $("#logExpand").addEventListener("click", (e) => {
+      logEl.classList.toggle("expanded");
+      e.target.textContent = logEl.classList.contains("expanded") ? "Collapse" : "Expand";
+    });
+
+    $("#btnStatus").addEventListener("click", () => {
+      if (!client || !client.connected) { log("Not connected"); return; }
+      const topic = $("#cmdTopic").value.trim();
+      client.publish(topic, JSON.stringify({ msg: "STATUS" }), { qos: 1 });
+      log(`PUB ${topic} {"msg":"STATUS"}`);
+    });
+
+    function pub(obj) {
+      if (!client || !client.connected) { log("Not connected"); return; }
+      const topic = $("#cmdTopic").value.trim();
+      const payload = JSON.stringify(obj);
+      client.publish(topic, payload, { qos: 1 });
+      log(`PUB ${topic} ${payload}`);
+    }
+
+    $("#pOn").addEventListener("click", () => pub({ msg: "POWER", state: "ON" }));
+    $("#pOff").addEventListener("click", () => pub({ msg: "POWER", state: "OFF" }));
+    $("#pClear").addEventListener("click", () => pub({ msg: "POWER", clear: true }));
+    $("#btnOnSecs").addEventListener("click", () => { const s = parseInt($("#onSecs").value || "0", 10); if (s > 0) pub({ msg: "POWER", on_for_s: s }); });
+    $("#btnOffSecs").addEventListener("click", () => { const s = parseInt($("#offSecs").value || "0", 10); if (s > 0) pub({ msg: "POWER", off_for_s: s }); });
+
+    const dayChips = Array.from(document.querySelectorAll("#days .chip"));
+    dayChips.forEach(ch => ch.addEventListener("click", () => ch.classList.toggle("active")));
+    $("#daysAll").addEventListener("click", () => dayChips.forEach(ch => ch.classList.add("active")));
+    $("#daysWeekdays").addEventListener("click", () => {
+      const s = new Set(["Mon", "Tue", "Wed", "Thu", "Fri"]);
+      dayChips.forEach(ch => ch.classList.toggle("active", s.has(ch.dataset.day)));
+    });
+    $("#daysWeekend").addEventListener("click", () => {
+      const s = new Set(["Sun", "Sat"]);
+      dayChips.forEach(ch => ch.classList.toggle("active", s.has(ch.dataset.day)));
+    });
+    function selectedDays() { return dayChips.filter(ch => ch.classList.contains("active")).map(ch => ch.dataset.day); }
+
+    $("#winSend").addEventListener("click", () => {
+      const s = $("#winStart").value, e = $("#winEnd").value;
+      const days = selectedDays();
+      if (!s || !e || days.length === 0) { alert("Start, End, and at least one Day required"); return; }
+      pub({ msg: "WINDOW", start: s, end: e, days });
+    });
+    $("#winDisable").addEventListener("click", () => pub({ msg: "WINDOW_OFF" }));
+
+    function parsePlaylistInput() { const raw = $("#playlist").value.trim(); return raw ? raw.split(",").map(x => x.trim()).filter(Boolean) : ["play1", "play2"]; }
+    $("#plStart").addEventListener("click", () => {
+      const arr = parsePlaylistInput();
+      const delay_s = parseInt($("#delayS").value || "60", 10);
+      const start_after_ms = parseInt($("#startAfter").value || "0", 10);
+      const obj = { msg: "START", playlist: arr };
+      if (delay_s > 0) obj.delay_s = delay_s;
+      if (start_after_ms > 0) obj.start_after_ms = start_after_ms;
+      pub(obj);
+    });
+    $("#plStop").addEventListener("click", () => pub({ msg: "STOP" }));
+
+    $("#play1").addEventListener("click", () => { const d = parseInt($("#singleDelayS").value || "30", 10); pub(d > 0 ? { msg: "PLAY1", delay_s: d } : { msg: "PLAY1" }); });
+    $("#play2").addEventListener("click", () => { const d = parseInt($("#singleDelayS").value || "30", 10); pub(d > 0 ? { msg: "PLAY2", delay_s: d } : { msg: "PLAY2" }); });
+    $("#btnDelay").addEventListener("click", () => { const d = parseInt($("#newDelayS").value || "0", 10); if (d > 0) pub({ msg: "DELAY", delay_s: d, reschedule: true }); });
+
+    const vol = $("#vol"), volVal = $("#volVal");
+    vol.addEventListener("input", () => volVal.textContent = vol.value + "%");
+    $("#volSend").addEventListener("click", () => { const v = Math.max(0, Math.min(1, parseInt(vol.value, 10) / 100)); pub({ msg: "VOLUME", val: v }); });
+    $("#liveClear").addEventListener("click", () => { liveEl.textContent = "—"; });
+  </script>
+</body>
+
+</html>
